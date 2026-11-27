@@ -252,6 +252,28 @@ track_interrupt() {
   moodle_start m5 "$IMG_NEW" v5 db5
   wait_start m5 600; rc=$?; check "next start cleans up and completes the upgrade" '[ $rc -eq 0 ] && logs m5 | grep -q "upgraded to Moodle 5.3.1"'
 
+  # A fresh install killed half way leaves a partial site; it must never be
+  # mistaken for an installed one.
+  section "interrupted fresh install"
+  db_up dbi mariadb
+  moodle_start mi "$IMG_NEW" vmi dbi
+  t=0
+  until logs mi | grep -q "installing a new site" || [ $t -ge 600 ]; do sleep 0.5; t=$((t + 1)); done
+  until [ "$(msql dbi "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='moodle'")" -gt 20 ] || [ $t -ge 900 ]; do sleep 0.5; t=$((t + 1)); done
+  docker kill "$P-mi" >/dev/null
+  check "killed while install_database.php was creating tables" '[ "$(msql dbi "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=\"moodle\"")" -gt 0 ]'
+  moodle_start mi "$IMG_NEW" vmi dbi
+  wait_start mi 120; rc=$?; check "next start refuses the partial site" '[ $rc -eq 1 ] && logs mi | grep -q "fresh install was interrupted"'
+  check "and writes INSTALL FAILED with the way out" 'vol_sh vmi "grep -q \"drop every\" /var/www/moodle/backups/UPGRADE-FAILED.txt"'
+  maria dbi -e "DROP DATABASE moodle; CREATE DATABASE moodle CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL ON moodle.* TO 'moodle'@'%';"
+  vol_sh vmi 'rm -f /var/www/moodle/backups/UPGRADE-FAILED.txt'
+  moodle_start mi "$IMG_NEW" vmi dbi
+  wait_start mi 300; rc=$?; check "after dropping the tables and the marker, it installs" '[ $rc -eq 0 ] && logs mi | grep -q "installed Moodle"'
+  db_up dbj mariadb
+  vol_sh vmj 'mkdir -p /var/www/moodle/backups && echo started=x > /var/www/moodle/backups/install-in-progress.txt'
+  moodle_start mj "$IMG_NEW" vmj dbj
+  wait_start mj 300; rc=$?; check "cut off before any table existed: simply installs again" '[ $rc -eq 0 ] && logs mj | grep -q "interrupted before it created any tables" && logs mj | grep -q "installed Moodle"'
+
   # A pod killed during upgrade.php, simulated exactly: the swap done, the
   # in-progress record written, and either nothing or something changed.
   section "interrupted upgrade.php, database unchanged / changed"
@@ -393,8 +415,10 @@ PHP
   course_before="$(msql mdb "SELECT COUNT(*) FROM m_course" old)"
   check "old site has the add-on, its data and a test course with files" '[ "$(msql mdb "SELECT note FROM m_local_insulaprobe" old)" = "migrated row" ] && [ "$course_before" -ge 2 ] && [ "$files_before" -gt 0 ]'
 
-  # The runbook: copy the database (the old site stays untouched as the
-  # fallback), copy code + moodledata into the new deployment's volume.
+  # The runbook: freeze the old site (CLI maintenance), copy the database
+  # (the old site stays untouched as the fallback), copy code + moodledata
+  # into the new deployment's volume.
+  docker exec "$P-old" php /var/www/html/admin/cli/maintenance.php --enable >/dev/null
   maria mdb -e "CREATE DATABASE moodle53 CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL ON moodle53.* TO 'moodle'@'%';"
   docker exec "$P-mdb" sh -c "mariadb-dump -uroot -prootpw --single-transaction old | mariadb -uroot -prootpw moodle53"
   docker run --rm -v "$P-oldhtml:/src/code:ro" -v "$P-olddata:/src/moodledata:ro" -v "$P-vmig:/var/www/moodle" \
@@ -414,6 +438,7 @@ PHP
   check "path into the old data dir relocated" 'vol_sh vmig "grep -q \"/var/www/moodle/moodledata/mytemp\" /var/www/moodle/config-local.php"'
   check "the original config.php kept in backups/" 'vol_sh vmig "grep -q old.example.test /var/www/moodle/backups/config.php.orig"'
   check "courses and files all there" '[ "$(msql mdb "SELECT COUNT(*) FROM m_course" moodle53)" = "$course_before" ] && [ "$(msql mdb "SELECT COUNT(*) FROM m_files WHERE filename <> \".\"" moodle53)" -ge "$files_before" ]'
+  check "the maintenance flag copied from the frozen old site is cleared" 'logs mig | grep -q "arrived in CLI maintenance mode" && [ "$(mcurl mig -o /dev/null -w "%{http_code}" "$WWWROOT/login/index.php")" = 200 ]'
   check "the old admin password works on the moved site" 'login mig admin "0ld!admin"'
   local fid
   fid="$(mphp mig <<'PHP'
@@ -427,7 +452,7 @@ PHP
     note "no mod_resource file in the XS course; pluginfile check skipped"
   fi
   check "status checks OK on the moved site" 'mcli mig admin/cli/checks.php 2>&1 | grep -q "All .status. checks OK"'
-  check "the old site is untouched (still 5.0.2)" '[ "$(msql mdb "SELECT value FROM m_config WHERE name=\"release\"" old | cut -d" " -f1)" = "$ver" ]'
+  check "the old site is untouched (still 5.0.2, still in maintenance)" '[ "$(msql mdb "SELECT value FROM m_config WHERE name=\"release\"" old | cut -d" " -f1)" = "$ver" ] && docker exec "$P-old" test -f /var/www/moodledata/climaintenance.html'
 
   section "migration refused: Moodle 5.0 on MariaDB 10.11 (5.3 needs 11.4)"
   db_up mdb10 mariadb mariadb:10.11

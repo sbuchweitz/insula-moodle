@@ -23,6 +23,9 @@ IN_PROGRESS="$BACKUP_DIR/upgrade-in-progress.txt"
 # Left by a failed upgrade (or install) next to UPGRADE-FAILED.txt. Deleting
 # the marker while this stays is the request to try again.
 INCOMPLETE="$BACKUP_DIR/upgrade-incomplete.txt"
+# Written right before install_database.php, removed when it succeeds. Found at
+# start, it means a fresh install was cut off (pod killed, node lost).
+INSTALL_IN_PROGRESS="$BACKUP_DIR/install-in-progress.txt"
 CODE_ID_FILE=".insula-code-id"
 # Marks a config.php as ours. Anything without it is a site's own config.php,
 # found when an existing site is moved onto this image.
@@ -32,6 +35,12 @@ log() { printf '[insula-moodle] %s\n' "$*"; }
 warn() { printf '[insula-moodle] WARNING: %s\n' "$*" >&2; }
 die() {
   printf '[insula-moodle] ERROR: %s\n' "$*" >&2
+  # Kubernetes copies this file into the container's terminated state, which is
+  # what Insula shows as the deployment's error — the reason, not just "exit
+  # code 1". It exists only under Kubernetes; the API caps it at 4 KiB.
+  if [ -w /dev/termination-log ]; then
+    printf '%s' "$*" | head -c 3800 > /dev/termination-log 2>/dev/null || true
+  fi
   exit 1
 }
 

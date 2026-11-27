@@ -154,6 +154,8 @@ anything changes. Upgrade the database server first.
      dropped, everything else is kept, and paths into the old data directory are
      moved;
    - keeps the original as `backups/config.php.orig`;
+   - clears the maintenance flag that came along with `moodledata/` (the old site
+     stays frozen);
    - upgrades the site to this release (Moodle 4.4 or later upgrades to 5.3
      directly).
 6. **Check the site, then switch the domain's route** to the new deployment. Remove

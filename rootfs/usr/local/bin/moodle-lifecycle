@@ -176,6 +176,7 @@ install_site() {
   write_config_stub "$CODE_DIR"
 
   log "installing a new site: $MOODLE_WWWROOT, admin user '$MOODLE_ADMIN_USER', language $MOODLE_LANG"
+  printf 'started=%s\n' "$(now_utc)" > "$INSTALL_IN_PROGRESS"
   if ! (cd "$CODE_DIR" && moodle_php admin/cli/install_database.php --agree-license \
           --lang="$MOODLE_LANG" --adminuser="$MOODLE_ADMIN_USER" --adminpass="$MOODLE_ADMIN_PASSWORD" \
           --adminemail="$MOODLE_ADMIN_EMAIL" --fullname="$MOODLE_SITE_NAME" --shortname="$MOODLE_SITE_NAME"); then
@@ -187,9 +188,10 @@ install_site() {
       printf 'starting with %s from %s, then delete this file.\n' "$DB_PREFIX" "$DB_NAME"
     } > "$FAILED_MARKER"
     printf 'kind=install\nfailed=%s\n' "$(now_utc)" > "$INCOMPLETE"
+    rm -f "$INSTALL_IN_PROGRESS"
     die "installation failed; see $FAILED_MARKER"
   fi
-  rm -f "$DATA_DIR/climaintenance.html"
+  rm -f "$DATA_DIR/climaintenance.html" "$INSTALL_IN_PROGRESS"
   log "installed Moodle $image_release at $MOODLE_WWWROOT"
 }
 
@@ -248,6 +250,14 @@ upgrade_site() {
 
   if [ "$rc" -eq 0 ]; then
     (cd "$CODE_DIR" && moodle_php admin/cli/purge_caches.php) || warn "purging caches failed; Moodle rebuilds them as needed"
+    # Moving a site means freezing the old one first (CLI maintenance mode),
+    # and that flag lives in moodledata — so it arrives with the copy. Left
+    # there, the moved site would answer every visitor with the maintenance
+    # page after a successful move.
+    if [ -n "$adopted" ] && [ -f "$DATA_DIR/climaintenance.html" ]; then
+      rm -f "$DATA_DIR/climaintenance.html"
+      log "the moved site arrived in CLI maintenance mode (copied from the old site); turned it off"
+    fi
     rm -f "$IN_PROGRESS"
     prune_dumps "$dump"
     log "upgraded to Moodle $image_release; the previous code is in backups/code-previous, the database dump in backups/$(basename "$dump")"
@@ -269,6 +279,29 @@ upgrade_site() {
 $tail_lines" "$site_release" "$image_release" "$dump"
   rm -f "$IN_PROGRESS"
   die "the upgrade to $image_release failed after it changed the database. See $FAILED_MARKER for how to retry or undo."
+}
+
+# A fresh install that was cut off leaves a partial site behind: config table,
+# some of the others. Treating it as an installed site would start Moodle on a
+# broken database, so it is a failed install. Cut off before it created
+# anything, it simply runs again.
+handle_interrupted_install() {
+  local n
+  n="$(db_prefixed_table_count)"
+  rm -f "$INSTALL_IN_PROGRESS"
+  if [ "${n:-0}" -eq 0 ]; then
+    log "an earlier install was interrupted before it created any tables; installing again"
+    return 0
+  fi
+  {
+    printf 'INSTALL FAILED — %s\n\n' "$(now_utc)"
+    printf 'Installing a new Moodle site into %s on %s (prefix %s) was interrupted\n' "$DB_NAME" "$DB_HOST" "$DB_PREFIX"
+    printf '(the container stopped while install_database.php was running).\n\n'
+    printf 'The database now holds a partial site (%s tables). To try again: drop every\n' "$n"
+    printf 'table starting with %s from %s, then delete this file.\n' "$DB_PREFIX" "$DB_NAME"
+  } > "$FAILED_MARKER"
+  printf 'kind=install\nfailed=%s\n' "$(now_utc)" > "$INCOMPLETE"
+  die "a fresh install was interrupted and left $n partial table(s). See $FAILED_MARKER."
 }
 
 # An upgrade that was cut off (pod killed, node lost) leaves IN_PROGRESS. If the
@@ -374,6 +407,9 @@ main() {
   if [ -f "$FAILED_MARKER" ]; then
     sed 's/^/[insula-moodle]   /' "$FAILED_MARKER" >&2
     die "Moodle is not started: an earlier install or upgrade failed. See $FAILED_MARKER (shown above)."
+  fi
+  if [ -f "$INSTALL_IN_PROGRESS" ]; then
+    handle_interrupted_install
   fi
   if [ -f "$IN_PROGRESS" ]; then
     handle_interrupted_upgrade

@@ -47,8 +47,9 @@ Apache starts, so no request ever reaches a half-upgraded site:
 
 New point releases appear by themselves. The weekly build finds a new Moodle release,
 builds it, and tests an upgrade from the previous release to it (including a refusal
-and an undo). Only then does it add the release to the catalog entry. After the next
-catalog sync, Insula offers it as an upgrade.
+and an undo). Only then does it add the release to the catalog entry. Insula picks it up
+at its next catalog sync (daily, or **Sync** under Applications → Repositories) and offers
+it as an upgrade.
 
 A new long-term-support line (5.3 → next LTS) is added to `moodle/manifest.json` by
 hand, because which versions may jump to it is a decision.
@@ -164,7 +165,8 @@ anything changes. Upgrade the database server first.
 tests/unit/test-tree.sh            # code-tree logic (no docker)
 tests/unit/test-config.sh          # env validation, config rendering, config.php conversion
 scripts/validate.py                # catalog entry vs. releases.json and the rules above
-scripts/build-context.sh 5.3.1 /tmp/ctx && docker build $(sed 's/^/--build-arg /' …) /tmp/ctx
+scripts/build-context.sh 5.3.1 /tmp/ctx > /tmp/args          # prints MOODLE_VERSION=… MOODLE_SHA256=…
+docker build $(sed 's/^/--build-arg /' /tmp/args) -t insula-moodle:5.3.1 /tmp/ctx
 scripts/check-office-tools.sh <image>
 IMG_OLD=<5.3.0 image> IMG_NEW=<5.3.1 image> tests/integration/run.sh [track…]
 ```

@@ -15,7 +15,7 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck -x -S warning rootfs/usr/local/bin/moodle-lifecycle rootfs/usr/local/lib/insula-moodle/*.sh \
-            rootfs/etc/entrypoint.d/*.sh rootfs/usr/bin/unoconv scripts/*.sh tests/unit/*.sh tests/integration/*.sh
+            rootfs/etc/entrypoint.d/*.sh rootfs/etc/s6-overlay/s6-rc.d/moodle-cron/run rootfs/usr/bin/unoconv scripts/*.sh tests/unit/*.sh tests/integration/*.sh
       - name: PHP syntax
         run: for f in rootfs/usr/local/lib/insula-moodle/*.php rootfs/usr/local/share/insula-moodle/config.php; do php -l "$f"; done
       - name: Unit tests

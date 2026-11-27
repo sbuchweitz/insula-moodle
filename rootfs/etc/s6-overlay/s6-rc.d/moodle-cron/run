@@ -1,12 +1,18 @@
 #!/command/with-contenv bash
-# Moodle's cron, every minute, inside the container — a new site needs no
+# shellcheck shell=bash
+# Moodle's cron, once a minute, inside the container — a new site needs no
 # Insula cron job to work.
 #
-# cron.php keeps itself alive for a few minutes per run while it works through
-# scheduled and ad hoc tasks (Moodle's keepalive), and Moodle's own task locks
-# stop two runs from doing the same work. Its output is long and routine
-# (Moodle keeps the per-task logs under Site administration > Server > Tasks),
-# so only a failing run is written to the pod log.
+# One run at a time, each started a minute after the previous one started:
+# Moodle's "Cron running" check expects a start at least every two minutes.
+# --keep-alive=0 because the default keep-alive holds each run open for three
+# minutes polling for work, which leaves the last start too old for that check;
+# ad hoc tasks (document conversions, …) still get picked up within a minute.
+# A run that takes longer (a big course backup) simply delays the next one.
+#
+# cron.php's output is long and routine (Moodle keeps the per-task logs under
+# Site administration > Server > Tasks), so only a failing run reaches the pod
+# log.
 case "${MOODLE_CRON:-true}" in
   true|TRUE|True|1|yes|on) ;;
   *)
@@ -19,9 +25,13 @@ cd /var/www/moodle/code || exit 1
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 while true; do
-  if ! php -d max_input_vars=10000 admin/cli/cron.php > "$log" 2>&1; then
+  start="$(date +%s)"
+  if ! php -d max_input_vars=10000 admin/cli/cron.php --keep-alive=0 > "$log" 2>&1; then
     echo "[insula-moodle] cron run failed; last lines:" >&2
     tail -n 20 "$log" >&2
   fi
-  sleep 30
+  elapsed=$(( $(date +%s) - start ))
+  if [ "$elapsed" -lt 60 ]; then
+    sleep $(( 60 - elapsed ))
+  fi
 done

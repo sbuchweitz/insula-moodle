@@ -478,6 +478,14 @@ PHP
   docker run --rm --network "$NET" curlimages/curl:8.11.1 -s -o /dev/null -H "Host: $HOST:8080" \
     -H "X-Forwarded-For: 203.0.113.7" "http://$P-o1:8080/login/index.php?insula=ipcheck" >/dev/null 2>&1
   check "Apache logs the client IP from X-Forwarded-For" 'logs o1 | grep "insula=ipcheck" | grep -q "203.0.113.7"'
+
+  # Moodle's "Cron running" check wants a cron start at least every two
+  # minutes; a cron.php left on its default keep-alive (three minutes) fails it
+  # a few minutes after start, which a check right after install never sees.
+  local up
+  up="$(docker inspect -f '{{.State.StartedAt}}' "$P-o1")"
+  while [ $(( $(date +%s) - $(date -d "$up" +%s) )) -lt 300 ]; do sleep 10; done
+  check "five minutes in, Moodle's status checks (incl. cron running) are all OK" 'mcli o1 admin/cli/checks.php 2>&1 | grep -q "All .status. checks OK"'
 }
 
 TRACKS=("$@")

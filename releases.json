@@ -1,0 +1,7 @@
+{
+  "_comment": "One entry per Moodle release this repository builds. sha256 is the official download's checksum (download.moodle.org publishes it next to each tarball); plugins_ref is the commit whose plugins/ directory is bundled into that release's image, so rebuilding a tag later reproduces the exact same code. scripts/add-release.py appends new point releases; nothing else edits this file.",
+  "releases": {
+    "5.3.0": { "sha256": "7e5edf110555956571f40e42acffde0eb23681ebebd212a2fec0fe7d795dd511", "plugins_ref": "HEAD" },
+    "5.3.1": { "sha256": "820ee2bcd89acc6b91df255b2010bbbab108f29952ab78895a79c4feabf541e7", "plugins_ref": "HEAD" }
+  }
+}

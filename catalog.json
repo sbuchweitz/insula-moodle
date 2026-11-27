@@ -1,0 +1,8 @@
+{
+  "version": "1",
+  "name": "insula-moodle",
+  "description": "Moodle for the Insula hosting platform, built on the Official Catalog's apache-php runtime. Add under Applications > Repositories.",
+  "entries": [
+    "moodle"
+  ]
+}

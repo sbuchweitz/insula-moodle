@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# The Moodle lifecycle: runs on every container start, BEFORE Apache and
+# PHP-FPM, so no request can reach a half-installed site or a half-swapped code
+# tree.
+#
+# What it does depends only on three facts:
+#   image  — the Moodle code baked into this image (its tag is the version
+#            selected in Insula; the tag's code never changes)
+#   tree   — the code on the volume (code/), stamped with the image it came from
+#   site   — the Moodle site in the database (core version, or none)
+#
+#   no site                         install a new site from MOODLE_ADMIN_* etc.
+#   site, tree == image             normal start: nothing to do
+#   site newer than image           refuse: Moodle cannot run older code against
+#                                   an upgraded database (a rollback needs the
+#                                   pre-upgrade dump)
+#   site, tree != image             upgrade: dump the database, swap in the new
+#                                   tree keeping add-on plugins, run upgrade.php
+#
+# The last case only arises when the deployment's version was changed in Insula
+# (or a site was moved onto this image): a restart on the same tag finds the
+# tree equal to the image and changes nothing.
+#
+# When upgrade.php fails, the database fingerprint decides what happens. If it
+# did not change (the environment check refused, a plugin dependency is
+# missing, …), the previous tree is put back and the start fails with the
+# reason; nothing needs undoing. If it changed, the start fails and keeps
+# failing until a person decides (backups/UPGRADE-FAILED.txt says how).
+set -Eeuo pipefail
+
+LIB="${INSULA_MOODLE_LIB:-/usr/local/lib/insula-moodle}"
+# shellcheck source=/dev/null
+. "$LIB/common.sh"
+# shellcheck source=/dev/null
+. "$LIB/env.sh"
+# shellcheck source=/dev/null
+. "$LIB/db.sh"
+# shellcheck source=/dev/null
+. "$LIB/tree.sh"
+
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+RESTORE_REQUEST="$BACKUP_DIR/RESTORE-PREVIOUS"
+
+moodle_php() {
+  # max_input_vars: Moodle's CLI scripts warn below 5000, and the admin
+  # settings defaults applied by upgrade.php go through the same code.
+  php -d max_input_vars=10000 -d display_errors=stderr "$@"
+}
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+latest_dump() {
+  find "$BACKUP_DIR" -maxdepth 1 -type f -name 'db-before-*.sql.gz' -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | head -n 1 | cut -d' ' -f2-
+}
+
+# The pre-upgrade dump for the database exactly as it is now. Reused when one
+# exists for the same fingerprint, so a start that keeps being refused (and
+# retried by Kubernetes) does not dump a large database every few minutes.
+ensure_dump() {
+  local fingerprint="$1" label="$2" existing f out
+  for f in "$BACKUP_DIR"/db-before-*.sql.gz; do
+    [ -f "$f" ] || continue
+    if [ -f "$f.fingerprint" ] && [ "$(cat "$f.fingerprint")" = "$fingerprint" ]; then
+      existing="$f"
+    fi
+  done
+  if [ -n "${existing:-}" ]; then
+    log "database unchanged since $(basename "$existing"); reusing that dump"
+    printf '%s\n' "$existing" > "$WORK_DIR/dump"
+    return 0
+  fi
+  out="$BACKUP_DIR/db-before-${label}-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+  log "dumping the database to backups/$(basename "$out") before changing anything"
+  if ! db_dump "$out"; then
+    die "could not dump the database (disk full? permissions?). Nothing was changed; the site is still on its previous version."
+  fi
+  printf '%s\n' "$fingerprint" > "$out.fingerprint"
+  log "dump done: $(du -h "$out" | cut -f1)"
+  printf '%s\n' "$out" > "$WORK_DIR/dump"
+}
+
+# Keep only the newest dump after a successful upgrade.
+prune_dumps() {
+  local keep="$1" f
+  for f in "$BACKUP_DIR"/db-before-*.sql.gz; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$keep" ] && continue
+    rm -f "$f" "$f.fingerprint"
+  done
+}
+
+write_failed_marker() {
+  local reason="$1" from="$2" to="$3" dump="$4"
+  {
+    printf 'UPGRADE FAILED — %s\n\n' "$(now_utc)"
+    printf 'From: %s\nTo:   %s\nDatabase: %s on %s (prefix %s)\n\n' "$from" "$to" "$DB_NAME" "$DB_HOST" "$DB_PREFIX"
+    printf '%s\n\n' "$reason"
+    printf 'The database was changed, so this container will not start Moodle again\n'
+    printf 'until a person decides what happens next. Either:\n\n'
+    printf '  RETRY  Fix the cause (see the log above and the pod log), then delete\n'
+    printf '         this file. On the next start the upgrade runs again; Moodle\n'
+    printf '         continues from the last step it completed.\n\n'
+    printf '  UNDO   Put the site back exactly as it was before the upgrade:\n'
+    printf '         1. In Insula, roll the deployment back to the previous version.\n'
+    printf '         2. Create an empty file named RESTORE-PREVIOUS next to this one.\n'
+    printf '         On the next start the database is restored from\n'
+    printf '           %s\n' "${dump:-<no dump>}"
+    printf '         and backups/code-previous is put back as code/.\n'
+  } > "$FAILED_MARKER"
+  printf 'kind=upgrade\nfrom_release=%s\nto_release=%s\ndump=%s\nfailed=%s\n' "$from" "$to" "$dump" "$(now_utc)" > "$INCOMPLETE"
+}
+
+# --- RESTORE-PREVIOUS ---------------------------------------------------------
+# An explicit, human-created request: restore the database from the newest
+# pre-upgrade dump and put the previous code tree back. Destructive for the
+# database (it drops this prefix's tables first), which is why it only ever runs
+# when someone created the request file.
+restore_previous_site() {
+  local dump tables
+  dump="$(latest_dump)"
+  [ -n "$dump" ] || die "RESTORE-PREVIOUS: no backups/db-before-*.sql.gz to restore from"
+  [ -d "$PREVIOUS_DIR" ] || die "RESTORE-PREVIOUS: backups/code-previous is missing; restore the code by hand"
+  gzip -t "$dump" || die "RESTORE-PREVIOUS: $dump is not a readable gzip file"
+  log "RESTORE-PREVIOUS: restoring the database from backups/$(basename "$dump")"
+  case "$DB_TYPE" in
+    mariadb|mysqli)
+      tables="$(db_sql "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name LIKE '$(db_prefix_like)'")"
+      if [ -n "$tables" ]; then
+        db_sql "SET FOREIGN_KEY_CHECKS=0; DROP TABLE $(printf '%s' "$tables" | sed 's/.*/`&`/' | paste -sd, -);"
+      fi
+      gzip -dc "$dump" | mariadb --defaults-extra-file="$DB_CLIENT_CNF" "$DB_NAME"
+      ;;
+    pgsql)
+      tables="$(db_sql "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_name LIKE '$(db_prefix_like)'")"
+      if [ -n "$tables" ]; then
+        db_sql "DROP TABLE $(printf '%s' "$tables" | sed 's/.*/"&"/' | paste -sd, -) CASCADE;"
+      fi
+      gzip -dc "$dump" | PGPASSWORD="$DB_PASSWORD" psql -X -q -v ON_ERROR_STOP=1 \
+        -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" >/dev/null
+      ;;
+  esac
+  log "RESTORE-PREVIOUS: putting backups/code-previous back as code/"
+  rm -rf "$MOODLE_ROOT/.code-failed"
+  [ -d "$CODE_DIR" ] && mv "$CODE_DIR" "$MOODLE_ROOT/.code-failed"
+  mv "$PREVIOUS_DIR" "$CODE_DIR"
+  rm -rf "$MOODLE_ROOT/.code-failed"
+  # The site cache describes the newer code; Moodle rebuilds it.
+  rm -rf "$DATA_DIR/cache" "$DATA_DIR/localcache"
+  rm -f "$FAILED_MARKER" "$IN_PROGRESS" "$INCOMPLETE" "$RESTORE_REQUEST"
+  log "RESTORE-PREVIOUS: done — the site is back on Moodle $(db_release)"
+}
+
+# --- fresh install -------------------------------------------------------------
+install_site() {
+  local n
+  # A data directory with files in it belongs to a site. Its database not being
+  # here means DB_NAME/DB_PREFIX point somewhere else — installing a new, empty
+  # site over that data would be the worst possible reading of it.
+  if [ -d "$DATA_DIR/filedir" ] && [ -n "$(find "$DATA_DIR/filedir" -mindepth 1 -print -quit)" ]; then
+    die "the database $DB_NAME has no Moodle site with prefix '$DB_PREFIX', but moodledata/ already holds a site's files. Check DB_HOST, DB_NAME and DB_PREFIX. A new site is never installed over existing data."
+  fi
+  n="$(db_prefixed_table_count)"
+  if [ "${n:-0}" -gt 0 ]; then
+    die "the database $DB_NAME has $n table(s) starting with '$DB_PREFIX' but no ${DB_PREFIX}config table (the remains of an interrupted install?). Drop those tables or choose another DB_PREFIX."
+  fi
+  validate_install_env || die "fix the settings above and restart"
+
+  if [ "$(tree_code_id "$CODE_DIR")" != "$image_id" ]; then
+    log "installing the code of Moodle $image_release into code/"
+    stage_next_tree "$CODE_DIR"
+    swap_in_next
+  fi
+  write_config_stub "$CODE_DIR"
+
+  log "installing a new site: $MOODLE_WWWROOT, admin user '$MOODLE_ADMIN_USER', language $MOODLE_LANG"
+  if ! (cd "$CODE_DIR" && moodle_php admin/cli/install_database.php --agree-license \
+          --lang="$MOODLE_LANG" --adminuser="$MOODLE_ADMIN_USER" --adminpass="$MOODLE_ADMIN_PASSWORD" \
+          --adminemail="$MOODLE_ADMIN_EMAIL" --fullname="$MOODLE_SITE_NAME" --shortname="$MOODLE_SITE_NAME"); then
+    {
+      printf 'INSTALL FAILED — %s\n\n' "$(now_utc)"
+      printf 'Installing a new Moodle %s site into %s on %s (prefix %s) failed. See the pod log.\n\n' \
+        "$image_release" "$DB_NAME" "$DB_HOST" "$DB_PREFIX"
+      printf 'The database now holds a partial site. To try again: drop every table\n'
+      printf 'starting with %s from %s, then delete this file.\n' "$DB_PREFIX" "$DB_NAME"
+    } > "$FAILED_MARKER"
+    printf 'kind=install\nfailed=%s\n' "$(now_utc)" > "$INCOMPLETE"
+    die "installation failed; see $FAILED_MARKER"
+  fi
+  rm -f "$DATA_DIR/climaintenance.html"
+  log "installed Moodle $image_release at $MOODLE_WWWROOT"
+}
+
+# --- upgrade / move onto this image --------------------------------------------
+upgrade_site() {
+  local site_core="$1" site_release="$2" fp_before fp_after dump rc adopted="" old_prefix label
+
+  log "upgrading Moodle $site_release ($site_core) -> $image_release ($image_core)"
+
+  # A site moved onto this image brings its own config.php. Convert it first:
+  # if it cannot be read, nothing has been touched yet.
+  if tree_present "$CODE_DIR" && [ -f "$CODE_DIR/config.php" ] && ! config_is_stub "$CODE_DIR"; then
+    log "converting the site's own config.php (settings kept in config-local.php)"
+    if ! php "$LIB/adopt-config.php" "$CODE_DIR/config.php" "$CODE_DIR" "$MOODLE_ROOT" "$WORK_DIR/config-local.php" \
+        > "$WORK_DIR/adopt.log" 2>&1; then
+      cat "$WORK_DIR/adopt.log" >&2
+      die "could not read the site's config.php; nothing was changed"
+    fi
+    grep -v '^old_prefix=' "$WORK_DIR/adopt.log" | sed 's/^/[insula-moodle]   /'
+    old_prefix="$(sed -n 's/^old_prefix=//p' "$WORK_DIR/adopt.log")"
+    if [ -n "$old_prefix" ] && [ "$old_prefix" != "$DB_PREFIX" ]; then
+      die "the site's config.php uses the table prefix '$old_prefix' but DB_PREFIX is '$DB_PREFIX'. Set DB_PREFIX=$old_prefix; nothing was changed."
+    fi
+    adopted=yes
+  fi
+
+  fp_before="$(db_fingerprint)"
+  label="$(printf '%s' "${site_release%% *}" | tr -c 'A-Za-z0-9.+-' '_')"
+  ensure_dump "$fp_before" "$label"
+  dump="$(cat "$WORK_DIR/dump")"
+
+  log "assembling the new code tree (Moodle $image_release + the site's add-on plugins)"
+  stage_next_tree "$CODE_DIR"
+
+  {
+    printf 'from_release=%s\nfrom_version=%s\nto_release=%s\nto_version=%s\n' \
+      "$site_release" "$site_core" "$image_release" "$image_core"
+    printf 'fingerprint=%s\ndump=%s\nstarted=%s\nadopted=%s\n' "$fp_before" "$dump" "$(now_utc)" "$adopted"
+  } > "$IN_PROGRESS"
+
+  swap_in_next
+  if [ -n "$adopted" ]; then
+    cp -p "$PREVIOUS_DIR/config.php" "$BACKUP_DIR/config.php.orig"
+    if [ -f "$LOCAL_CONFIG" ]; then
+      warn "config-local.php already exists; leaving it as it is (the converted settings are in the pod log)"
+    else
+      cp "$WORK_DIR/config-local.php" "$LOCAL_CONFIG"
+    fi
+  fi
+
+  log "running Moodle's upgrade (admin/cli/upgrade.php)"
+  set +e
+  (cd "$CODE_DIR" && moodle_php admin/cli/upgrade.php --non-interactive) 2>&1 | tee "$WORK_DIR/upgrade.log"
+  rc="${PIPESTATUS[0]}"
+  set -e
+
+  if [ "$rc" -eq 0 ]; then
+    (cd "$CODE_DIR" && moodle_php admin/cli/purge_caches.php) || warn "purging caches failed; Moodle rebuilds them as needed"
+    rm -f "$IN_PROGRESS"
+    prune_dumps "$dump"
+    log "upgraded to Moodle $image_release; the previous code is in backups/code-previous, the database dump in backups/$(basename "$dump")"
+    return 0
+  fi
+
+  local tail_lines
+  tail_lines="$(grep -v '^[[:space:]]*$' "$WORK_DIR/upgrade.log" | tail -n 15)"
+  if fp_after="$(db_fingerprint 2>/dev/null)" && [ "$fp_after" = "$fp_before" ]; then
+    restore_previous
+    if [ -n "$adopted" ] && cmp -s "$LOCAL_CONFIG" "$WORK_DIR/config-local.php"; then
+      rm -f "$LOCAL_CONFIG"
+    fi
+    rm -f "$IN_PROGRESS"
+    printf '%s\n' "$tail_lines" >&2
+    die "Moodle refused the upgrade to $image_release before changing anything (see above). The previous code is back and the database is untouched; fix the cause, or roll the deployment back to the previous version in Insula."
+  fi
+  write_failed_marker "upgrade.php exited with status $rc. Last lines:
+$tail_lines" "$site_release" "$image_release" "$dump"
+  rm -f "$IN_PROGRESS"
+  die "the upgrade to $image_release failed after it changed the database. See $FAILED_MARKER for how to retry or undo."
+}
+
+# An upgrade that was cut off (pod killed, node lost) leaves IN_PROGRESS. If the
+# database never changed, putting the old tree back is safe and the upgrade can
+# simply run again; otherwise it is a failure for a person to decide on.
+handle_interrupted_upgrade() {
+  local fp_then fp_now from to dump
+  fp_then="$(sed -n 's/^fingerprint=//p' "$IN_PROGRESS")"
+  from="$(sed -n 's/^from_release=//p' "$IN_PROGRESS")"
+  to="$(sed -n 's/^to_release=//p' "$IN_PROGRESS")"
+  dump="$(sed -n 's/^dump=//p' "$IN_PROGRESS")"
+  fp_now="$(db_fingerprint)"
+  if [ -n "$fp_then" ] && [ "$fp_now" = "$fp_then" ]; then
+    log "an upgrade from $from to $to was interrupted before it changed the database; putting the previous code back"
+    restore_previous || true
+    rm -f "$IN_PROGRESS"
+    return 0
+  fi
+  write_failed_marker "The upgrade was interrupted (the container stopped while upgrade.php was running)." "$from" "$to" "$dump"
+  rm -f "$IN_PROGRESS"
+  die "an upgrade from $from to $to was interrupted after it changed the database. See $FAILED_MARKER."
+}
+
+# moodledata/ is stamped with the site's identifier (Moodle's siteidentifier).
+# A volume started against another site's database — another DB_NAME, another
+# DB_PREFIX in the same database — would otherwise run that site on this
+# site's files, sessions and caches.
+SITE_STAMP="$DATA_DIR/.insula-site"
+
+check_site_stamp() {
+  local site_ident stamped
+  site_ident="$(db_sql "SELECT value FROM ${DB_PREFIX}config WHERE name = 'siteidentifier'")" || return 0
+  [ -n "$site_ident" ] || return 0
+  if [ -f "$SITE_STAMP" ]; then
+    stamped="$(tr -d '[:space:]' < "$SITE_STAMP")"
+    if [ -n "$stamped" ] && [ "$stamped" != "$site_ident" ]; then
+      die "moodledata/ belongs to another Moodle site than the one in $DB_NAME (prefix $DB_PREFIX): site $stamped vs $site_ident. Check DB_NAME and DB_PREFIX. Delete moodledata/.insula-site only if this data really belongs to that database."
+    fi
+  fi
+}
+
+stamp_site() {
+  local site_ident
+  site_ident="$(db_sql "SELECT value FROM ${DB_PREFIX}config WHERE name = 'siteidentifier'" 2>/dev/null)" || return 0
+  [ -n "$site_ident" ] && printf '%s\n' "$site_ident" > "$SITE_STAMP"
+}
+
+# UPGRADE-FAILED.txt was deleted while upgrade-incomplete.txt stayed: a person
+# fixed the cause and asks for another attempt.
+retry_incomplete() {
+  local kind from dump rc n
+  kind="$(sed -n 's/^kind=//p' "$INCOMPLETE")"
+  if [ "$kind" = install ]; then
+    n="$(db_prefixed_table_count)"
+    if [ "${n:-0}" -gt 0 ]; then
+      die "the failed install left $n table(s) starting with '$DB_PREFIX' in $DB_NAME. Drop them before trying again (UPGRADE-FAILED.txt was deleted, but the partial site is still there)."
+    fi
+    rm -f "$INCOMPLETE"
+    return 0
+  fi
+  from="$(sed -n 's/^from_release=//p' "$INCOMPLETE")"
+  dump="$(sed -n 's/^dump=//p' "$INCOMPLETE")"
+  if [ "$(tree_code_id "$CODE_DIR")" != "$image_id" ]; then
+    # Another version was selected meanwhile: the normal upgrade path takes over.
+    log "retrying the failed upgrade from $from with Moodle $image_release"
+    rm -f "$INCOMPLETE"
+    return 0
+  fi
+  log "retrying the failed upgrade from $from to $image_release (UPGRADE-FAILED.txt was deleted)"
+  set +e
+  (cd "$CODE_DIR" && moodle_php admin/cli/upgrade.php --non-interactive) 2>&1 | tee "$WORK_DIR/upgrade.log"
+  rc="${PIPESTATUS[0]}"
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    write_failed_marker "The retried upgrade.php exited with status $rc. Last lines:
+$(grep -v '^[[:space:]]*$' "$WORK_DIR/upgrade.log" | tail -n 15)" "$from" "$image_release" "$dump"
+    die "the retried upgrade to $image_release failed again. See $FAILED_MARKER."
+  fi
+  (cd "$CODE_DIR" && moodle_php admin/cli/purge_caches.php) || warn "purging caches failed; Moodle rebuilds them as needed"
+  rm -f "$INCOMPLETE"
+  [ -n "$dump" ] && prune_dumps "$dump"
+  log "upgraded to Moodle $image_release (retry)"
+}
+
+main() {
+  image_id="$(tree_code_id "$MOODLE_SRC_DIR")"
+  image_core="$(tree_core_version "$MOODLE_SRC_DIR")"
+  image_release="$(tree_release "$MOODLE_SRC_DIR")"
+  [ -n "$image_id" ] && [ -n "$image_core" ] || die "this image has no Moodle code at $MOODLE_SRC_DIR (broken build)"
+  log "image: Moodle $image_release ($image_core), code ${image_id:0:12}"
+
+  validate_env || die "fix the settings above and restart"
+  mkdir -p "$DATA_DIR" "$BACKUP_DIR"
+  php "$LIB/render-config.php" "$INSULA_MOODLE_ETC/platform-config.php"
+  db_prepare_client
+
+  db_wait || die "the database is not reachable; Moodle was not started"
+  log "database: $DB_TYPE $(db_server_version) at $DB_HOST:$DB_PORT, database $DB_NAME, prefix $DB_PREFIX"
+
+  if [ -f "$RESTORE_REQUEST" ]; then
+    restore_previous_site
+  fi
+  if [ -f "$FAILED_MARKER" ]; then
+    sed 's/^/[insula-moodle]   /' "$FAILED_MARKER" >&2
+    die "Moodle is not started: an earlier install or upgrade failed. See $FAILED_MARKER (shown above)."
+  fi
+  if [ -f "$IN_PROGRESS" ]; then
+    handle_interrupted_upgrade
+  fi
+  recover_interrupted_swap
+  if [ -f "$INCOMPLETE" ]; then
+    retry_incomplete
+  fi
+
+  local installed=0
+  db_site_installed || installed=$?
+  case "$installed" in
+    0) ;;
+    1) install_site; stamp_site; return 0 ;;
+    *) die "could not query the database $DB_NAME" ;;
+  esac
+  check_site_stamp
+
+  local site_core site_release cmp tree_id
+  site_core="$(db_core_version)"
+  site_release="$(db_release)"
+  [ -n "$site_core" ] || die "the database has a ${DB_PREFIX}config table but no Moodle version in it"
+  log "site: Moodle $site_release ($site_core)"
+
+  cmp="$(version_cmp "$image_core" "$site_core")"
+  if [ "$cmp" -lt 0 ]; then
+    die "this image has Moodle $image_release ($image_core), older than the site's Moodle $site_release ($site_core). Moodle cannot run older code against an upgraded database. To go back, roll back the version in Insula AND create backups/RESTORE-PREVIOUS (restores backups/$(basename "$(latest_dump)" 2>/dev/null)); otherwise select version ${site_release%% *} again."
+  fi
+
+  tree_id="$(tree_code_id "$CODE_DIR")"
+  if [ "$tree_id" = "$image_id" ] && [ "$cmp" -eq 0 ]; then
+    write_config_stub "$CODE_DIR"
+    stamp_site
+    log "code and database are on Moodle $image_release; nothing to do"
+    # Not run here on purpose (that is the site admin's call), but said: an
+    # add-on plugin dropped into code/ waits for Site administration >
+    # Notifications, and Moodle's cron stays suspended until then.
+    local pending=0
+    (cd "$CODE_DIR" && moodle_php admin/cli/upgrade.php --is-pending >/dev/null 2>&1) || pending=$?
+    if [ "$pending" -eq 2 ]; then
+      warn "Moodle has a pending upgrade (an add-on plugin was added or updated in code/). Finish it under Site administration > Notifications; cron is suspended until then."
+    fi
+    return 0
+  fi
+  if [ "$cmp" -eq 0 ] && [ -n "$tree_id" ]; then
+    warn "the code on the volume differs from this image's although both are Moodle $image_release; replacing it"
+  fi
+  upgrade_site "$site_core" "$site_release"
+  stamp_site
+}
+
+main "$@"

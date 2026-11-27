@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck -x -S warning rootfs/usr/local/bin/moodle-lifecycle rootfs/usr/local/lib/insula-moodle/*.sh \
+            rootfs/etc/entrypoint.d/*.sh rootfs/usr/bin/unoconv scripts/*.sh tests/unit/*.sh tests/integration/*.sh
+      - name: PHP syntax
+        run: for f in rootfs/usr/local/lib/insula-moodle/*.php rootfs/usr/local/share/insula-moodle/config.php; do php -l "$f"; done
+      - name: Unit tests
+        run: |
+          tests/unit/test-tree.sh
+          tests/unit/test-config.sh
+      - name: Catalog entry
+        run: |
+          pip install --quiet jsonschema
+          scripts/validate.py

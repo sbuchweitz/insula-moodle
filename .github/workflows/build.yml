@@ -1,0 +1,149 @@
+name: build
+
+# Builds, tests and publishes ghcr.io/sbuchweitz/insula-moodle:<moodle version>.
+#
+# Weekly, each line's newest two point releases are rebuilt on the freshly
+# patched apache-php base (same Moodle code, so a site that restarts on its tag
+# changes nothing but OS and PHP patches). The same run looks for a new Moodle
+# point release; when there is one it is built, tested by upgrading the
+# previous release to it, and only then added to the catalog entry — so the
+# Upgrade button in Insula never offers an image that was not built and tested.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - rootfs/**
+      - plugins/**
+      - releases.json
+      - scripts/build-context.sh
+      - scripts/check-office-tools.sh
+      - scripts/office-tools-probe.sh
+      - tests/integration/**
+      - .github/workflows/build.yml
+  schedule:
+    # Mondays 06:47 UTC: after the Official Catalog's weekly rebuild of
+    # apache-php (04:17 UTC), so every tag picks up that week's base patches.
+    - cron: '47 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: Extra versions to build (space-separated), on top of each line's newest two
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/sbuchweitz/insula-moodle
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      versions: ${{ steps.plan.outputs.versions }}
+      new: ${{ steps.detect.outputs.new }}
+      new_sha256: ${{ steps.detect.outputs.sha256 }}
+      previous: ${{ steps.detect.outputs.previous }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        name: Look for a new Moodle point release
+        if: github.event_name != 'push'
+        run: |
+          line="$(python3 -c 'import json; m = json.load(open("moodle/manifest.json")); print(".".join(m["version"].split(".")[:2]))')"
+          found="$(scripts/detect-release.sh "$line" || true)"
+          if [ -n "$found" ]; then
+            read -r new sha <<<"$found"
+            {
+              echo "new=$new"
+              echo "sha256=$sha"
+              echo "previous=$(python3 -c 'import json; print(json.load(open("moodle/manifest.json"))["version"])')"
+            } >> "$GITHUB_OUTPUT"
+            echo "New Moodle release: $new" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - id: plan
+        run: echo "versions=$(scripts/plan.py ${{ steps.detect.outputs.new }} ${{ inputs.versions }})" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.plan.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Record the new release for this build only
+        if: matrix.version == needs.plan.outputs.new
+        run: scripts/add-release.py "${{ matrix.version }}" "${{ needs.plan.outputs.new_sha256 }}" "$GITHUB_SHA" --releases-only
+      - name: Build
+        run: |
+          scripts/build-context.sh "${{ matrix.version }}" "$RUNNER_TEMP/ctx" > "$RUNNER_TEMP/args"
+          args=()
+          while IFS= read -r a; do args+=(--build-arg "$a"); done < "$RUNNER_TEMP/args"
+          docker build --pull "${args[@]}" -t "local/insula-moodle:${{ matrix.version }}" "$RUNNER_TEMP/ctx"
+          docker run --rm --entrypoint cat "local/insula-moodle:${{ matrix.version }}" /usr/src/moodle/.insula-code-id
+      - name: Office toolchain works
+        run: scripts/check-office-tools.sh "local/insula-moodle:${{ matrix.version }}"
+      - name: Installs a site and passes Moodle's checks
+        run: IMG_OLD="local/insula-moodle:${{ matrix.version }}" IMG_NEW="local/insula-moodle:${{ matrix.version }}" tests/integration/run.sh install
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push
+        run: |
+          v="${{ matrix.version }}"
+          for tag in "$v" "$v-${GITHUB_SHA::7}-${GITHUB_RUN_ID}"; do
+            docker tag "local/insula-moodle:$v" "$IMAGE:$tag"
+            docker push "$IMAGE:$tag"
+          done
+
+  # A new release is only offered once the previous release upgrades to it.
+  upgrade-test:
+    needs: [plan, build]
+    if: needs.plan.outputs.new != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Upgrade ${{ needs.plan.outputs.previous }} -> ${{ needs.plan.outputs.new }}, refusal, undo
+        run: |
+          docker pull -q "$IMAGE:${{ needs.plan.outputs.previous }}"
+          docker pull -q "$IMAGE:${{ needs.plan.outputs.new }}"
+          IMG_OLD="$IMAGE:${{ needs.plan.outputs.previous }}" IMG_NEW="$IMAGE:${{ needs.plan.outputs.new }}" \
+            tests/integration/run.sh upgrade undo
+
+  publish:
+    needs: [plan, build, upgrade-test]
+    if: needs.plan.outputs.new != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Offer ${{ needs.plan.outputs.new }} in the catalog
+        run: |
+          pip install --quiet jsonschema
+          scripts/add-release.py "${{ needs.plan.outputs.new }}" "${{ needs.plan.outputs.new_sha256 }}" "$GITHUB_SHA"
+          scripts/validate.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add releases.json moodle/manifest.json
+          git commit -m "feat: Moodle ${{ needs.plan.outputs.new }}"
+          git pull --rebase origin main
+          git push origin HEAD:main

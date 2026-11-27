@@ -1,0 +1,323 @@
+{
+  "name": "Moodle",
+  "code": "moodle",
+  "type": "application",
+  "versionLockMode": "strict",
+  "version": "5.3.1",
+  "description": "Moodle LMS (long-term-support line) with document conversion (LibreOffice, Ghostscript) for PDF annotation, an external MariaDB/MySQL/PostgreSQL database, plugins and files on the deployment's volume, and upgrades that run only when you change the version.",
+  "url": "https://moodle.org",
+  "documentation": "https://github.com/sbuchweitz/insula-moodle#readme",
+  "category": "education",
+  "tenancy": [
+    "single-tenant"
+  ],
+  "components": [
+    {
+      "name": "moodle",
+      "type": "deployment",
+      "image": "ghcr.io/sbuchweitz/insula-moodle:5.3.1",
+      "ports": [
+        {
+          "port": 8080,
+          "protocol": "TCP",
+          "ingress": true
+        }
+      ]
+    }
+  ],
+  "networking": {
+    "ingress_ports": [
+      {
+        "port": 443,
+        "protocol": "TCP",
+        "tls": true,
+        "description": "Moodle web interface"
+      }
+    ],
+    "host_ports": [],
+    "websocket": false,
+    "notes": "Uploads are limited by PHP_UPLOAD_MAX_FILE_SIZE / PHP_POST_MAX_SIZE and by the route's request-body limit."
+  },
+  "volumes": [
+    {
+      "local_path": ".",
+      "container_path": "/var/www/moodle",
+      "description": "code/ (Moodle and its add-on plugins), moodledata/ (files), config-local.php (site settings), backups/ (pre-upgrade database dump and previous code)"
+    }
+  ],
+  "resources": {
+    "minimum": {
+      "cpu": "0.25",
+      "memory": "1Gi",
+      "storage": "10Gi"
+    },
+    "recommended": {
+      "cpu": "1.00",
+      "memory": "2Gi",
+      "storage": "30Gi"
+    }
+  },
+  "health_check": {
+    "path": "/healthcheck",
+    "port": 8080,
+    "initial_delay_seconds": 60,
+    "period_seconds": 30
+  },
+  "parameters": [
+    {
+      "key": "MOODLE_WWWROOT",
+      "label": "Site URL",
+      "type": "string",
+      "required": true,
+      "description": "The full public address of the site, e.g. https://learn.example.com — the domain you route to this deployment. Changing it later moves the site to a new address."
+    },
+    {
+      "key": "DB_TYPE",
+      "label": "Database type",
+      "type": "string",
+      "default": "mariadb",
+      "description": "mariadb (also for MySQL-compatible MariaDB servers), mysqli (MySQL) or pgsql (PostgreSQL). The database runs as its own deployment; this app does not include one."
+    },
+    {
+      "key": "DB_HOST",
+      "label": "Database host",
+      "type": "string",
+      "required": true,
+      "description": "Service name of the database deployment in this tenant (shown on the database's page)."
+    },
+    {
+      "key": "DB_PORT",
+      "label": "Database port",
+      "type": "integer",
+      "description": "Leave empty for the default: 3306 for MariaDB/MySQL, 5432 for PostgreSQL.",
+      "advanced": true
+    },
+    {
+      "key": "DB_NAME",
+      "label": "Database name",
+      "type": "string",
+      "required": true,
+      "description": "An existing, empty database for a new site, or the database of the site being moved here."
+    },
+    {
+      "key": "DB_USER",
+      "label": "Database user",
+      "type": "string",
+      "required": true,
+      "description": "Needs full rights on the database (create, alter and drop tables)."
+    },
+    {
+      "key": "DB_PASSWORD",
+      "label": "Database password",
+      "type": "secret",
+      "required": true,
+      "description": "Password of the database user."
+    },
+    {
+      "key": "DB_PREFIX",
+      "label": "Table prefix",
+      "type": "string",
+      "default": "mdl_",
+      "description": "Prefix of Moodle's tables. Keep mdl_ for a new site; a moved site must use the prefix from its config.php.",
+      "advanced": true
+    },
+    {
+      "key": "DB_COLLATION",
+      "label": "Database collation",
+      "type": "string",
+      "default": "utf8mb4_unicode_ci",
+      "description": "MariaDB/MySQL only. Must match the database's collation; databases created by Insula use utf8mb4_unicode_ci.",
+      "advanced": true
+    },
+    {
+      "key": "MOODLE_ADMIN_USER",
+      "label": "Admin username",
+      "type": "string",
+      "default": "admin",
+      "description": "Only used when a new site is installed; ignored afterwards."
+    },
+    {
+      "key": "MOODLE_ADMIN_EMAIL",
+      "label": "Admin e-mail",
+      "type": "string",
+      "description": "Only used when a new site is installed; ignored afterwards. Required for a new site."
+    },
+    {
+      "key": "MOODLE_SITE_NAME",
+      "label": "Site name",
+      "type": "string",
+      "default": "Moodle",
+      "description": "Only used when a new site is installed; change it later in Moodle (Site administration > General > Site home settings)."
+    },
+    {
+      "key": "MOODLE_LANG",
+      "label": "Site language",
+      "type": "string",
+      "default": "en",
+      "description": "Only used when a new site is installed: the default language (e.g. en, de, fr). Its language pack is downloaded during installation."
+    },
+    {
+      "key": "MOODLE_BBB_SERVER_URL",
+      "label": "BigBlueButton server URL",
+      "type": "string",
+      "description": "Optional. Pins the BigBlueButton server (e.g. https://bbb.example.com/bigbluebutton/) so it cannot be changed in Moodle — changing it there resets every recording. Set together with the secret, or leave both empty to manage it in Moodle.",
+      "advanced": true
+    },
+    {
+      "key": "MOODLE_BBB_SHARED_SECRET",
+      "label": "BigBlueButton shared secret",
+      "type": "secret",
+      "description": "Optional, with the server URL. Kept out of Moodle's database and its backups.",
+      "advanced": true
+    },
+    {
+      "key": "MOODLE_CRON",
+      "label": "Run Moodle cron",
+      "type": "boolean",
+      "default": true,
+      "description": "Runs Moodle's cron inside the container every minute. Turn off only if cron runs elsewhere.",
+      "advanced": true
+    },
+    {
+      "key": "PHP_MEMORY_LIMIT",
+      "label": "PHP memory limit",
+      "type": "string",
+      "default": "256M",
+      "description": "Maximum memory per PHP request (e.g. 256M, 512M). Moodle raises it itself for course backups and restores."
+    },
+    {
+      "key": "PHP_UPLOAD_MAX_FILE_SIZE",
+      "label": "Upload max file size",
+      "type": "string",
+      "default": "100M",
+      "description": "Largest single file a user can upload (assignments, SCORM packages, course backups)."
+    },
+    {
+      "key": "PHP_POST_MAX_SIZE",
+      "label": "POST max size",
+      "type": "string",
+      "default": "100M",
+      "description": "Largest request body; keep it at least the upload size."
+    },
+    {
+      "key": "PHP_MAX_EXECUTION_TIME",
+      "label": "Max execution time",
+      "type": "string",
+      "default": "99",
+      "description": "Seconds a web request may run. Moodle extends it itself for long operations."
+    },
+    {
+      "key": "PHP_MAX_INPUT_VARS",
+      "label": "Max input variables",
+      "type": "integer",
+      "default": 5000,
+      "description": "Moodle needs at least 5000; large gradebooks and quiz editing may need more."
+    },
+    {
+      "key": "PHP_DATE_TIMEZONE",
+      "label": "PHP timezone",
+      "type": "string",
+      "default": "UTC",
+      "description": "Timezone for PHP and the logs. Moodle's own timezone is set in Moodle."
+    },
+    {
+      "key": "PHP_FPM_PM_MAX_CHILDREN",
+      "label": "PHP workers",
+      "type": "integer",
+      "default": 10,
+      "description": "How many requests are handled at once. Each worker may use up to the PHP memory limit — raise the deployment's memory with it."
+    },
+    {
+      "key": "PHP_FPM_PM_CONTROL",
+      "label": "PHP process manager",
+      "type": "string",
+      "default": "ondemand",
+      "description": "ondemand (lowest idle memory), dynamic (keeps spare workers warm) or static.",
+      "advanced": true
+    },
+    {
+      "key": "PHP_FPM_PM_MAX_REQUESTS",
+      "label": "Requests per PHP worker",
+      "type": "integer",
+      "default": 500,
+      "description": "Recycle a worker after this many requests; bounds memory leaks.",
+      "advanced": true
+    },
+    {
+      "key": "PHP_OPCACHE_MEMORY_CONSUMPTION",
+      "label": "OPcache memory (MB)",
+      "type": "integer",
+      "default": 128,
+      "description": "Shared memory for compiled PHP code.",
+      "advanced": true
+    }
+  ],
+  "tags": [
+    "education",
+    "lms",
+    "elearning",
+    "courses",
+    "moodle",
+    "bigbluebutton"
+  ],
+  "env_vars": {
+    "configurable": [
+      "MOODLE_WWWROOT",
+      "DB_TYPE",
+      "DB_HOST",
+      "DB_PORT",
+      "DB_NAME",
+      "DB_USER",
+      "DB_PASSWORD",
+      "DB_PREFIX",
+      "DB_COLLATION",
+      "MOODLE_ADMIN_USER",
+      "MOODLE_ADMIN_EMAIL",
+      "MOODLE_SITE_NAME",
+      "MOODLE_LANG",
+      "MOODLE_BBB_SERVER_URL",
+      "MOODLE_BBB_SHARED_SECRET",
+      "MOODLE_CRON",
+      "PHP_MEMORY_LIMIT",
+      "PHP_UPLOAD_MAX_FILE_SIZE",
+      "PHP_POST_MAX_SIZE",
+      "PHP_MAX_EXECUTION_TIME",
+      "PHP_MAX_INPUT_VARS",
+      "PHP_DATE_TIMEZONE",
+      "PHP_FPM_PM_MAX_CHILDREN",
+      "PHP_FPM_PM_CONTROL",
+      "PHP_FPM_PM_MAX_REQUESTS",
+      "PHP_OPCACHE_MEMORY_CONSUMPTION"
+    ],
+    "generated": [
+      "MOODLE_ADMIN_PASSWORD"
+    ],
+    "fixed": {}
+  },
+  "supportedVersions": [
+    {
+      "version": "5.3.0",
+      "isDefault": false,
+      "components": [
+        {
+          "name": "moodle",
+          "image": "ghcr.io/sbuchweitz/insula-moodle:5.3.0"
+        }
+      ],
+      "upgradeFrom": []
+    },
+    {
+      "version": "5.3.1",
+      "isDefault": true,
+      "components": [
+        {
+          "name": "moodle",
+          "image": "ghcr.io/sbuchweitz/insula-moodle:5.3.1"
+        }
+      ],
+      "upgradeFrom": [
+        "5.3.0"
+      ]
+    }
+  ]
+}

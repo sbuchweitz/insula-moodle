@@ -85,7 +85,11 @@ RUN set -eux; \
       "https://download.moodle.org/download.php/direct/${stable}/${name}"; \
     echo "${MOODLE_SHA256}  /tmp/moodle.tgz" | sha256sum -c -; \
     mkdir -p /usr/src/moodle; \
-    tar -xzf /tmp/moodle.tgz --strip-components=1 -C /usr/src/moodle; \
+    # Owner and modes are settled HERE, in the layer that creates the files: a
+    # later chown/chmod -R would rewrite every file into a new layer, i.e. a
+    # second copy of the whole tree (518 MB) for every node to download.
+    tar -xzf /tmp/moodle.tgz --strip-components=1 --no-same-owner -C /usr/src/moodle; \
+    chmod -R a+rX,go-w /usr/src/moodle; \
     rm -f /tmp/moodle.tgz; \
     release="$(sed -n "s/^[[:space:]]*\$release[[:space:]]*=[[:space:]]*'\([^ ']*\).*/\1/p" /usr/src/moodle/public/version.php)"; \
     expected="${MOODLE_VERSION%.0}"; \
@@ -118,9 +122,11 @@ RUN set -eux; \
     cd /usr/src/moodle; \
     find . -type f ! -name .insula-code-id ! -path './vendor/composer/*' ! -path ./vendor/autoload.php -print0 \
       | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 > .insula-code-id; \
-    chown -R root:root /usr/src/moodle; \
-    chmod -R a+rX,go-w /usr/src/moodle; \
-    cat .insula-code-id
+    cat .insula-code-id; \
+    # Everything must already be root-owned and not writable by others (see the
+    # extraction step); fail the build rather than fix it with a copying chown.
+    test -z "$(find /usr/src/moodle ! -user root -print -quit)"; \
+    test -z "$(find /usr/src/moodle -perm /022 -print -quit)"
 
 COPY rootfs/etc/ /etc/
 COPY rootfs/usr/local/ /usr/local/

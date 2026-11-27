@@ -173,6 +173,21 @@ fingerprint() { # fingerprint DBCONTAINER [PREFIX] [DBTYPE]
     '. /usr/local/lib/insula-moodle/common.sh; . /usr/local/lib/insula-moodle/db.sh; db_prepare_client; db_fingerprint'
 }
 
+# All of Moodle's status checks OK, allowing one cron cycle: right after a
+# start that followed downtime, "Cron running" rightly warns about the gap
+# between the last two runs until the next run (a minute later) closes it.
+checks_ok() {
+  local name="$1" i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if mcli "$name" admin/cli/checks.php > "$LOGS/checks-$name.txt" 2>&1 \
+       && grep -q "All .status. checks OK" "$LOGS/checks-$name.txt"; then
+      return 0
+    fi
+    sleep 10
+  done
+  return 1
+}
+
 db_release() { msql "$1" "SELECT value FROM ${2:-mdl_}config WHERE name='release'"; }
 pg_release() { psql_ "$1" "SELECT value FROM ${2:-mdl_}config WHERE name='release'"; }
 code_id() { vol_sh "$1" 'cat /var/www/moodle/code/.insula-code-id 2>/dev/null'; }

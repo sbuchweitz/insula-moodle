@@ -37,7 +37,7 @@ track_install() {
   check "lifecycle installed a new site" 'logs m1 | grep -q "installed Moodle 5.3"'
   check "login page answers 200" '[ "$(mcurl m1 -o /dev/null -w "%{http_code}" "$WWWROOT/login/index.php")" = 200 ]'
   check "admin can log in with MOODLE_ADMIN_PASSWORD" 'login m1 admin "$ADMIN_PASS"'
-  check "all of Moodle's status checks pass (incl. the router)" 'mcli m1 admin/cli/checks.php 2>&1 | grep -q "All .status. checks OK"'
+  check "all of Moodle's status checks pass (incl. the router)" 'checks_ok m1'
   mphp m1 > "$LOGS/env-install.txt" 2>&1 <<'PHP'
 require_once($CFG->libdir . '/environmentlib.php');
 [$ok, $results] = check_moodle_environment(normalize_version($CFG->release), ENV_SELECT_RELEASE);
@@ -146,7 +146,7 @@ track_upgrade() {
   check "previous code kept in backups/code-previous" '[ "$(vol_sh v2 "cat /var/www/moodle/backups/code-previous/.insula-code-id")" = "$OLD_ID" ]'
   check "exactly one dump kept" '[ "$(vol_sh v2 "ls /var/www/moodle/backups/db-before-*.sql.gz | wc -l")" = 1 ]'
   check "admin logs in after the upgrade" 'login m2 admin "$ADMIN_PASS"'
-  check "status checks OK after the upgrade" 'mcli m2 admin/cli/checks.php 2>&1 | grep -q "All .status. checks OK"'
+  check "status checks OK after the upgrade" 'checks_ok m2'
 
   moodle_start m2 "$IMG_NEW" v2 db2
   wait_start m2 300
@@ -451,7 +451,7 @@ PHP
   else
     note "no mod_resource file in the XS course; pluginfile check skipped"
   fi
-  check "status checks OK on the moved site" 'mcli mig admin/cli/checks.php 2>&1 | grep -q "All .status. checks OK"'
+  check "status checks OK on the moved site" 'checks_ok mig'
   check "the old site is untouched (still 5.0.2, still in maintenance)" '[ "$(msql mdb "SELECT value FROM m_config WHERE name=\"release\"" old | cut -d" " -f1)" = "$ver" ] && docker exec "$P-old" test -f /var/www/moodledata/climaintenance.html'
 
   section "migration refused: Moodle 5.0 on MariaDB 10.11 (5.3 needs 11.4)"
@@ -510,7 +510,7 @@ PHP
   local up
   up="$(docker inspect -f '{{.State.StartedAt}}' "$P-o1")"
   while [ $(( $(date +%s) - $(date -d "$up" +%s) )) -lt 300 ]; do sleep 10; done
-  check "five minutes in, Moodle's status checks (incl. cron running) are all OK" 'mcli o1 admin/cli/checks.php 2>&1 | grep -q "All .status. checks OK"'
+  check "five minutes in, Moodle's status checks (incl. cron running) are all OK" 'checks_ok o1'
 }
 
 TRACKS=("$@")

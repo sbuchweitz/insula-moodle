@@ -47,9 +47,9 @@ Apache starts, so no request ever reaches a half-upgraded site:
 
 New point releases appear by themselves. The weekly build finds a new Moodle release,
 builds it, and tests an upgrade from the previous release to it (including a refusal
-and an undo). Only then does it add the release to the catalog entry. Insula picks it up
-at its next catalog sync (daily, or **Sync** under Applications → Repositories) and offers
-it as an upgrade.
+and an undo). Only then does it add the release to the catalog entry. Insula offers it as
+an upgrade after its next sync of this repository: turn on the repository's daily
+auto-sync under Applications → Repositories (it starts switched off), or click **Sync**.
 
 A new long-term-support line (5.3 → next LTS) is added to `moodle/manifest.json` by
 hand, because which versions may jump to it is a decision.

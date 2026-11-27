@@ -60,7 +60,8 @@ hand, because which versions may jump to it is a decision.
   old, or an add-on plugin's dependency is missing.
   - The previous code is put back and the database is untouched; its fingerprint is
     compared before and after.
-  - The container exits with the reason, and Insula shows the deployment as failing.
+  - The container exits with the reason, and Insula shows the deployment as failed,
+    with that reason as its error.
   - Fix the cause, or roll the version back in Insula. Retries reuse the existing
     dump.
 - **It failed after the database changed.** The container keeps refusing to start
@@ -70,6 +71,10 @@ hand, because which versions may jump to it is a decision.
   - **Undo:** roll the version back in Insula, then create an empty file
     `backups/RESTORE-PREVIOUS`. The next start restores the database from the dump
     and puts `backups/code-previous` back.
+- **A pod is killed during a fresh install.** If it had not created any tables yet,
+  the install simply runs again. Otherwise the partial site is never taken for a
+  real one: the start refuses, and `UPGRADE-FAILED.txt` says to drop the half-created
+  tables and delete the file.
 - **A pod is killed during an upgrade.** The next start sees the in-progress record.
   - Database unchanged: the old code is put back and the upgrade runs again.
   - Database changed: it is treated as a failed upgrade (above).

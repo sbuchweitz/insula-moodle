@@ -151,6 +151,28 @@ printf '<?php\n$x = 1;\n' > "$work/notconfig.php"
 php "$lib/adopt-config.php" "$work/notconfig.php" "$work/old/moodle" /var/www/moodle "$work/x.php" > "$work/adopt2.out" 2>&1; rc=$?
 check "a file that is not a Moodle config.php is refused" '[ $rc -ne 0 ] && grep -q "does not look like a Moodle config.php" "$work/adopt2.out"'
 
+echo "== the maintenance page"
+mp_port=$(( 20000 + RANDOM % 20000 ))
+mp_status="$work/maint.txt"
+printf '%s\n%s\n' "$(( $(date +%s) - 185 ))" 'Updating the database <script>alert(1)</script>' > "$mp_status"
+INSULA_MOODLE_MAINT_STATUS="$mp_status" php -S "127.0.0.1:$mp_port" -t "$repo/rootfs/usr/local/share/insula-moodle/maintenance-root" \
+  "$repo/rootfs/usr/local/share/insula-moodle/maintenance.php" > /dev/null 2>&1 &
+mp_pid=$!
+for _ in $(seq 1 25); do curl -s -o /dev/null "http://127.0.0.1:$mp_port/" && break; sleep 0.2; done
+curl -s -i "http://127.0.0.1:$mp_port/course/view.php?id=2" > "$work/maint.out"
+check "any path answers 503" 'head -1 "$work/maint.out" | grep -q " 503 "'
+check "with Retry-After and no-store" 'grep -qi "^Retry-After: 30" "$work/maint.out" && grep -qi "^Cache-Control: no-store" "$work/maint.out"'
+check "says the site is being updated, refreshes itself" 'grep -q "This site is being updated" "$work/maint.out" && grep -q "http-equiv=\"refresh\"" "$work/maint.out"'
+check "shows the step, HTML-escaped" 'grep -q "Updating the database &lt;script&gt;" "$work/maint.out" && ! grep -q "<script>alert" "$work/maint.out"'
+check "shows the elapsed time" 'grep -q "Started 3 minutes ago." "$work/maint.out"'
+check "names no Moodle version" '! grep -qE "5\.[0-9]|Moodle [0-9]" "$work/maint.out"'
+curl -s -i -X HEAD "http://127.0.0.1:$mp_port/" > "$work/maint-head.out" 2>/dev/null
+check "HEAD gets the 503 too" 'head -1 "$work/maint-head.out" | grep -q " 503 "'
+rm -f "$mp_status"
+curl -s "http://127.0.0.1:$mp_port/" > "$work/maint-nostatus.out"
+check "without a status file it still answers, without a step" 'grep -q "This site is being updated" "$work/maint-nostatus.out" && ! grep -q "class=\"step\"" "$work/maint-nostatus.out"'
+kill "$mp_pid" 2>/dev/null; wait "$mp_pid" 2>/dev/null
+
 echo
 echo "config: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

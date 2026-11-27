@@ -68,6 +68,7 @@ PHP
   wait_start m1 300
   check "restart on the same tag: nothing to do" 'logs m1 | grep -q "nothing to do"'
   check "restart does not dump or swap anything" '! logs m1 | grep -qE "dumping|assembling"'
+  check "and shows no maintenance page" '! logs m1 | grep -q "maintenance page up"'
   check "admin password changed in Moodle survives the restart" 'login m1 admin "Ch4nged!byadmin"'
   check "MOODLE_ADMIN_PASSWORD is ignored after install" '! login m1 admin "ignored-after-install"'
   check "SMTP setting made in Moodle survives the restart" '[ "$(mcli m1 admin/cli/cfg.php --name=smtphosts)" = smtp.example.test:587 ]'
@@ -98,6 +99,16 @@ PHP
   check "PHP setting from env reaches PHP-FPM" 'docker exec "$P-m1" php-fpm -i 2>/dev/null | grep -q "memory_limit => 384M"'
   check "Moodle cron is running in the container" 'docker exec "$P-m1" sh -c "pgrep -f admin/cli/cron.php" >/dev/null'
   vol_sh v1 'rm -f /var/www/moodle/config-local.php'
+
+  # The database is down when the site starts (a node restart, a DB upgrade):
+  # visitors get the maintenance page, then Moodle once the database is back.
+  docker stop "$P-db1" >/dev/null
+  moodle_start m1 "$IMG_OLD" v1 db1 -e MOODLE_DB_WAIT_SECONDS=300
+  catch_maint_page m1 "$LOGS/maint-dbwait.txt" 60; rc=$?
+  check "database down at start: visitors get the maintenance page" '[ $rc -eq 0 ] && grep -q "Waiting for the database" "$LOGS/maint-dbwait.txt"'
+  docker start "$P-db1" >/dev/null
+  wait_start m1 300; rc=$?
+  check "and Moodle once the database is back" '[ $rc -eq 0 ] && [ "$(mcurl m1 -o /dev/null -w "%{http_code}" "$WWWROOT/login/index.php")" = 200 ]'
 
   # An add-on dropped into code/ without finishing it in Moodle: the start
   # says so, and does not run the upgrade itself.
@@ -138,7 +149,11 @@ track_upgrade() {
   vol_sh v2 'rm -rf /var/www/moodle/code/public/local/insulabad'
   docker stop "$P-m2" >/dev/null
   moodle_start m2 "$IMG_NEW" v2 db2
+  catch_maint_page m2 "$LOGS/maint-upgrade.txt" 300; rc=$?
+  check "during the upgrade visitors get the maintenance page (503, Retry-After)" '[ $rc -eq 0 ] && grep -qi "^Retry-After: 30" "$LOGS/maint-upgrade.txt"'
+  check "it names the current step and no version" 'grep -qE "Backing up the database|Preparing the new version|Updating the database" "$LOGS/maint-upgrade.txt" && ! grep -qE "5\.3|Moodle [0-9]" "$LOGS/maint-upgrade.txt"'
   wait_start m2 600; rc=$?; check "upgrade 5.3.0 -> 5.3.1 succeeds" '[ $rc -eq 0 ] && logs m2 | grep -q "upgraded to Moodle 5.3.1"'
+  check "after the upgrade Apache has the port: Moodle answers, not the page" '[ "$(mcurl m2 -o /dev/null -w "%{http_code}" "$WWWROOT/login/index.php")" = 200 ]'
   check "database is on 5.3.1" 'db_release db2 | grep -q "^5.3.1 "'
   check "code on the volume is the new image's" '[ "$(code_id v2)" = "$NEW_ID" ]'
   check "add-on plugin kept in the new tree" 'vol_sh v2 "[ -f /var/www/moodle/code/public/local/insulaprobe/version.php ]"'

@@ -35,7 +35,11 @@ patches for the newest two releases of each line.
   and does nothing.
 
 When the version does change, the container's start-up does the following before
-Apache starts, so no request ever reaches a half-upgraded site:
+Apache starts, so no request ever reaches a half-upgraded site. Meanwhile visitors get a
+"This site is being updated" page (HTTP 503 with `Retry-After`) that names the current
+step and refreshes itself; it never shows the Moodle version. The same page appears
+during a fresh install and while the database is not reachable yet, never on an ordinary
+restart.
 
 1. Dump the database to `backups/db-before-<release>-<time>.sql.gz`.
 2. Build the new code tree next to the old one: this release's code plus every add-on

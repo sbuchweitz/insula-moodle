@@ -39,7 +39,66 @@ LIB="${INSULA_MOODLE_LIB:-/usr/local/lib/insula-moodle}"
 . "$LIB/tree.sh"
 
 WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"' EXIT
+trap 'maint_stop; rm -rf "$WORK_DIR"' EXIT
+
+# --- the maintenance page ------------------------------------------------------
+# While a long step runs (install, upgrade, restore, waiting for the database)
+# PHP's built-in web server answers on the site's port with a 503 "being
+# updated" page (share/insula-moodle/maintenance.php), so visitors do not get
+# the proxy's bare 502. It is stopped before Apache needs the port, and by the
+# EXIT trap on any failure. A start with nothing to do never starts it.
+MAINT_PORT="${APACHE_HTTP_PORT:-8080}"
+MAINT_STATUS="${INSULA_MOODLE_MAINT_STATUS:-/var/cache/insula-moodle/maintenance.txt}"
+MAINT_PID=""
+MAINT_STARTED=""
+
+# maint_step TEXT — show TEXT as the current step, starting the page if needed.
+# Never fails the lifecycle: without the page visitors get the 502 as before.
+maint_step() {
+  MAINT_STARTED="${MAINT_STARTED:-$(date +%s)}"
+  printf '%s\n%s\n' "$MAINT_STARTED" "$1" > "$MAINT_STATUS.tmp" 2>/dev/null \
+    && mv "$MAINT_STATUS.tmp" "$MAINT_STATUS" 2>/dev/null
+  if [ -n "$MAINT_PID" ] && kill -0 "$MAINT_PID" 2>/dev/null; then
+    return 0
+  fi
+  local addr
+  # [::] also accepts IPv4 where the pod has IPv6; without IPv6 it cannot bind
+  # and 0.0.0.0 takes over.
+  for addr in "[::]:$MAINT_PORT" "0.0.0.0:$MAINT_PORT"; do
+    INSULA_MOODLE_MAINT_STATUS="$MAINT_STATUS" PHP_CLI_SERVER_WORKERS=4 \
+      setsid php -d display_errors=0 -d log_errors=0 -S "$addr" -t "$INSULA_MOODLE_SHARE/maintenance-root" \
+      "$INSULA_MOODLE_SHARE/maintenance.php" > /dev/null 2>&1 &
+    MAINT_PID=$!
+    local _
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$MAINT_PORT/"; then
+        log "maintenance page up while: $1"
+        return 0
+      fi
+      kill -0 "$MAINT_PID" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -TERM -- "-$MAINT_PID" 2>/dev/null || true
+    wait "$MAINT_PID" 2>/dev/null || true
+  done
+  MAINT_PID=""
+  warn "could not start the maintenance page; visitors see the proxy's error until Moodle is up"
+}
+
+maint_stop() {
+  rm -f "$MAINT_STATUS" "$MAINT_STATUS.tmp" 2>/dev/null
+  [ -n "$MAINT_PID" ] || return 0
+  # setsid made the server its own process group: this also ends its workers.
+  kill -TERM -- "-$MAINT_PID" 2>/dev/null || true
+  wait "$MAINT_PID" 2>/dev/null || true
+  MAINT_PID=""
+  local _
+  for _ in $(seq 1 50); do
+    curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$MAINT_PORT/" || return 0
+    sleep 0.2
+  done
+  warn "the maintenance page did not release port $MAINT_PORT"
+}
 
 RESTORE_REQUEST="$BACKUP_DIR/RESTORE-PREVIOUS"
 
@@ -124,6 +183,7 @@ restore_previous_site() {
   [ -n "$dump" ] || die "RESTORE-PREVIOUS: no backups/db-before-*.sql.gz to restore from"
   [ -d "$PREVIOUS_DIR" ] || die "RESTORE-PREVIOUS: backups/code-previous is missing; restore the code by hand"
   gzip -t "$dump" || die "RESTORE-PREVIOUS: $dump is not a readable gzip file"
+  maint_step "Restoring the previous version"
   log "RESTORE-PREVIOUS: restoring the database from backups/$(basename "$dump")"
   case "$DB_TYPE" in
     mariadb|mysqli)
@@ -168,6 +228,7 @@ install_site() {
   fi
   validate_install_env || die "fix the settings above and restart"
 
+  maint_step "Setting up the site"
   if [ "$(tree_code_id "$CODE_DIR")" != "$image_id" ]; then
     log "installing the code of Moodle $image_release into code/"
     stage_next_tree "$CODE_DIR"
@@ -218,11 +279,13 @@ upgrade_site() {
     adopted=yes
   fi
 
+  maint_step "Backing up the database"
   fp_before="$(db_fingerprint)"
   label="$(printf '%s' "${site_release%% *}" | tr -c 'A-Za-z0-9.+-' '_')"
   ensure_dump "$fp_before" "$label"
   dump="$(cat "$WORK_DIR/dump")"
 
+  maint_step "Preparing the new version"
   log "assembling the new code tree (Moodle $image_release + the site's add-on plugins)"
   stage_next_tree "$CODE_DIR"
 
@@ -242,6 +305,7 @@ upgrade_site() {
     fi
   fi
 
+  maint_step "Updating the database"
   log "running Moodle's upgrade (admin/cli/upgrade.php)"
   set +e
   (cd "$CODE_DIR" && moodle_php admin/cli/upgrade.php --non-interactive) 2>&1 | tee "$WORK_DIR/upgrade.log"
@@ -370,6 +434,7 @@ retry_incomplete() {
     rm -f "$INCOMPLETE"
     return 0
   fi
+  maint_step "Updating the database"
   log "retrying the failed upgrade from $from to $image_release (UPGRADE-FAILED.txt was deleted)"
   set +e
   (cd "$CODE_DIR" && moodle_php admin/cli/upgrade.php --non-interactive) 2>&1 | tee "$WORK_DIR/upgrade.log"
@@ -398,6 +463,10 @@ main() {
   php "$LIB/render-config.php" "$INSULA_MOODLE_ETC/platform-config.php"
   db_prepare_client
 
+  # A database that answers at once (the normal case) shows no page at all.
+  if ! db_sql 'SELECT 1' >/dev/null 2>&1; then
+    maint_step "Waiting for the database"
+  fi
   db_wait || die "the database is not reachable; Moodle was not started"
   log "database: $DB_TYPE $(db_server_version) at $DB_HOST:$DB_PORT, database $DB_NAME, prefix $DB_PREFIX"
 
@@ -462,3 +531,4 @@ main() {
 }
 
 main "$@"
+maint_stop

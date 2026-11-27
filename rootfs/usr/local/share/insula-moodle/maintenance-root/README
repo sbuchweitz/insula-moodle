@@ -1,0 +1,2 @@
+Empty on purpose: the document root PHP's built-in server needs while the
+maintenance page answers every request through maintenance.php.

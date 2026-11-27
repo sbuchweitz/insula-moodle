@@ -104,7 +104,9 @@ wait_start() {
       docker logs "$P-$name" > "$LOGS/$name.$(date +%s).log" 2>&1 || true
       return 1
     fi
-    if docker exec "$P-$name" curl -s -o /dev/null --max-time 5 http://127.0.0.1:8080/healthcheck 2>/dev/null; then
+    # -f: the maintenance page answers 503 on every path while the lifecycle
+    # works; only Apache's /healthcheck answers 200.
+    if docker exec "$P-$name" curl -sf -o /dev/null --max-time 5 http://127.0.0.1:8080/healthcheck 2>/dev/null; then
       docker logs "$P-$name" > "$LOGS/$name.$(date +%s).log" 2>&1 || true
       return 0
     fi
@@ -117,6 +119,25 @@ wait_start() {
 }
 
 logs() { docker logs "$P-$1" 2>&1; }
+
+# catch_maint_page NAME OUT [TIMEOUT] — poll the site until the maintenance
+# page answers (saved to OUT, returns 0); 1 if the container exits first or
+# Moodle answers without the page ever having been seen.
+catch_maint_page() {
+  local name="$1" out="$2" timeout="${3:-300}" t=0 r
+  while [ "$t" -lt $((timeout * 4)) ]; do
+    r="$(docker exec "$P-$name" curl -s -i --max-time 2 "http://127.0.0.1:8080/course/view.php?id=1" 2>/dev/null || true)"
+    if printf '%s' "$r" | head -1 | grep -q " 503 " && printf '%s' "$r" | grep -q "This site is being updated"; then
+      printf '%s\n' "$r" > "$out"
+      return 0
+    fi
+    if printf '%s' "$r" | head -1 | grep -qE " (200|303) "; then return 1; fi
+    [ "$(docker inspect -f '{{.State.Status}}' "$P-$name" 2>/dev/null)" = running ] || return 1
+    sleep 0.25
+    t=$((t + 1))
+  done
+  return 1
+}
 exit_code() { docker inspect -f '{{.State.ExitCode}}' "$P-$1"; }
 
 # Run a command in a stopped-or-running site's volume as www-data, using the

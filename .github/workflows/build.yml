@@ -69,7 +69,11 @@ jobs:
             echo "New Moodle release: $new" >> "$GITHUB_STEP_SUMMARY"
           fi
       - id: plan
-        run: echo "versions=$(scripts/plan.py ${{ steps.detect.outputs.new }} ${{ inputs.versions }})" >> "$GITHUB_OUTPUT"
+        run: |
+          # Assigned first: inside echo "$(…)" a failing plan.py would pass silently.
+          versions="$(scripts/plan.py ${{ steps.detect.outputs.new }} ${{ inputs.versions }})"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "Building: $versions" >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: plan
